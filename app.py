@@ -104,9 +104,18 @@ class RouterLLM(LLM):
 
 
 def _file_signature(pdf_paths: List[Path]) -> str:
+    cwd = Path.cwd().resolve()
+
+    def _stable_path(p: Path) -> str:
+        resolved = p.resolve()
+        try:
+            return str(resolved.relative_to(cwd))
+        except ValueError:
+            return str(p)
+
     payload = [
         {
-            "path": str(p.relative_to(Path.cwd())),
+            "path": _stable_path(p),
             "size": p.stat().st_size,
             "mtime": int(p.stat().st_mtime),
         }
@@ -209,7 +218,9 @@ def _select_llm() -> Tuple[RouterLLM, str]:
 
     # Provider priority: explicit provider, then fallback.
     candidates = [LLM_PROVIDER, "openrouter", "huggingface"]
-    tried = []
+
+    # Do not hard-fail startup by probing external APIs here.
+    # Return a configured client and let request-time errors surface in chat responses.
     for provider in candidates:
         if provider == "openrouter" and or_token:
             llm = RouterLLM(
@@ -219,14 +230,11 @@ def _select_llm() -> Tuple[RouterLLM, str]:
                 timeout=OPENROUTER_TIMEOUT,
                 base_url=OPENROUTER_BASE_URL,
             )
-            try:
-                llm.invoke("Reply with exactly: ok")
-                return llm, f"openrouter:{OPENROUTER_MODEL}"
-            except Exception as exc:
-                tried.append(f"openrouter ({type(exc).__name__})")
+            return llm, f"openrouter:{OPENROUTER_MODEL}"
 
-        if provider == "huggingface" and hf_token:
-            for model in [HF_INFERENCE_API, *HF_INFERENCE_FALLBACKS]:
+        if provider == "huggingface":
+            model = HF_INFERENCE_API or (HF_INFERENCE_FALLBACKS[0] if HF_INFERENCE_FALLBACKS else "")
+            if model:
                 llm = RouterLLM(
                     provider="huggingface",
                     model_id=model,
@@ -234,15 +242,11 @@ def _select_llm() -> Tuple[RouterLLM, str]:
                     timeout=HF_API_TIMEOUT,
                     task=HF_TASK,
                 )
-                try:
-                    llm.invoke("Reply with exactly: ok")
-                    return llm, f"huggingface:{model}"
-                except Exception as exc:
-                    tried.append(f"{model} ({type(exc).__name__})")
+                suffix = " (unauthenticated)" if not hf_token else ""
+                return llm, f"huggingface:{model}{suffix}"
 
     raise RuntimeError(
-        "No working cloud LLM found. Set OPENROUTER_API_KEY for free OpenRouter models or "
-        "HUGGINGFACEHUB_API_TOKEN for HF Inference API. Attempts: " + "; ".join(tried)
+        "No LLM configuration found. Set OPENROUTER_API_KEY or configure HF_INFERENCE_API"
     )
 
 
@@ -301,7 +305,14 @@ class RAGService:
             "Answer:"
         )
 
-        answer = self.llm.invoke(prompt).strip()
+        try:
+            answer = self.llm.invoke(prompt).strip()
+        except Exception as exc:
+            answer = (
+                "I couldn't reach the language model service right now. "
+                "Please set HF_TOKEN/OPENROUTER_API_KEY or try again shortly. "
+                f"(error: {type(exc).__name__})"
+            )
         if not answer:
             answer = "I couldn't generate a grounded answer from the current knowledge base."
 
