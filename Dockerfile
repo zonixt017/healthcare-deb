@@ -44,11 +44,11 @@ RUN mkdir -p /app/.cache/huggingface /app/.cache/transformers vectorstore models
 USER appuser
 
 # ── Expose common Streamlit ports ─────────────────────────────────────────────
-EXPOSE 7860 8501
+EXPOSE 7860
 
 # ── Health check (uses PORT if set) ───────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD curl --fail "http://localhost:${PORT:-7860}/_stcore/health" || exit 1
+    CMD curl --fail "http://localhost:${PORT:-7860}/" || exit 1
 
 # ── Run Streamlit ─────────────────────────────────────────────────────────────
 CMD ["./start.sh"]
