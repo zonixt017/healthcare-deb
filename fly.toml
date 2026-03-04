@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fly.io Configuration
+# Deploy with: fly launch
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = "healthcare-assistant"
+primary_region = "sin"  # Singapore - change to your preferred region
+# Regions: sin (Singapore), nrt (Tokyo), syd (Sydney), fra (Frankfurt), 
+#          lhr (London), ord (Chicago), sea (Seattle), lax (Los Angeles)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "7860"
+  PDF_DATA_PATH = "data/"
+  VECTOR_STORE_PATH = "vectorstore"
+  EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+  RETRIEVER_K = "3"
+  EMBED_DEVICE = "cpu"
+  N_GPU_LAYERS = "0"
+  HF_INFERENCE_API = "mistralai/Mistral-7B-Instruct-v0.2"
+
+[http_service]
+  internal_port = 7860
+  force_https = true
+  auto_stop_machines = true    # Stop when idle (saves costs)
+  auto_start_machines = true   # Start on request
+  min_machines_running = 0     # Allow full shutdown
+  processes = ["app"]
+
+[[http_service.checks]]
+  grace_period = "120s"        # Allow time for model loading
+  interval = "30s"
+  method = "GET"
+  path = "/_stcore/health"
+  timeout = "10s"
+
+[[vm]]
+  memory = "2gb"               # Minimum recommended
+  cpu_kind = "shared"
+  cpus = 2
+
+# Persistent volume for vector store (optional but recommended)
+# Uncomment to enable:
+# [[mounts]]
+#   source = "healthcare_data"
+#   destination = "/app/vectorstore"
+#   initial_size = "1gb"
+
+# Secrets (set via CLI: fly secrets set HUGGINGFACEHUB_API_TOKEN=your_token)
+# Do NOT put secrets here!

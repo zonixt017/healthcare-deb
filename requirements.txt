@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Healthcare Assistant Chatbot — Python dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core UI ───────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── LangChain ecosystem ───────────────────────────────────────────────────────
+langchain>=0.2.11
+langchain-community>=0.2.10
+langchain-huggingface>=0.0.3
+langchain-core>=0.2.23
+langchain-text-splitters>=0.2.2
+
+# ── Vector store ──────────────────────────────────────────────────────────────
+faiss-cpu>=1.8.0
+
+# ── Embeddings ────────────────────────────────────────────────────────────────
+sentence-transformers>=2.7.0
+
+# ── PDF loading ───────────────────────────────────────────────────────────────
+pypdf>=4.2.0
+
+# ── Environment management ────────────────────────────────────────────────────
+python-dotenv>=1.0.1
+
+# ── HuggingFace hub client ────────────────────────────────────────────────────
+huggingface-hub>=0.27.1
+
+# ── PyTorch (for GPU detection and embeddings) ───────────────────────────────
+torch>=2.0.0
+
+# ── Local LLM (GPU-accelerated via llama.cpp) ─────────────────────────────────
+# Install the CUDA-enabled build AFTER getting a stable WiFi connection.
+# See WIFI_SETUP_GUIDE.md for exact commands.
+#
+# CPU-only (default):
+#   pip install llama-cpp-python
+#
+# GPU-accelerated (CUDA 12.x — recommended for GTX 1650):
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121

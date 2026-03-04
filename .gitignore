@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment & Secrets
+# ─────────────────────────────────────────────────────────────────────────────
+.env
+*.env.local
+*.env.*.local
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDE & Editors
+# ─────────────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OS Generated
+# ─────────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project Specific
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Vector store (auto-generated, can be large)
+vectorstore/
+
+# GGUF model files (large binary files — download separately)
+models/
+*.gguf
+*.bin
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Test coverage
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/

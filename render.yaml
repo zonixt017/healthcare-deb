@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Render.com Configuration
+# Deploy with: render blueprint deploy
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  - type: web
+    name: healthcare-assistant
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    
+    # Build configuration
+    build:
+      source: dockerfile
+    
+    # Deployment configuration
+    plan: starter  # Options: starter, standard, pro
+    region: oregon  # Options: oregon, frankfurt, singapore, ohio
+    
+    # Health check
+    healthCheckPath: /_stcore/health
+    
+    # Environment variables
+    envVars:
+      - key: HUGGINGFACEHUB_API_TOKEN
+        sync: false  # Set manually in Render dashboard
+      - key: HF_INFERENCE_API
+        value: mistralai/Mistral-7B-Instruct-v0.2
+      - key: PDF_DATA_PATH
+        value: data/
+      - key: VECTOR_STORE_PATH
+        value: vectorstore
+      - key: EMBEDDING_MODEL
+        value: sentence-transformers/all-MiniLM-L6-v2
+      - key: RETRIEVER_K
+        value: "3"
+      - key: EMBED_DEVICE
+        value: cpu
+      - key: N_GPU_LAYERS
+        value: "0"
+    
+    # Auto-deploy on push to main
+    autoDeploy: true
+    
+    # Scaling (for standard plan and above)
+    # numInstances: 1

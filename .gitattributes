@@ -1,0 +1,5 @@
+# Ensure Unix line endings for scripts used inside Linux containers
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.toml text eol=lfvectorstore/index.faiss filter=lfs diff=lfs merge=lfs -text
+vectorstore/index.pkl filter=lfs diff=lfs merge=lfs -text
