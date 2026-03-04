@@ -104,9 +104,18 @@ class RouterLLM(LLM):
 
 
 def _file_signature(pdf_paths: List[Path]) -> str:
+    cwd = Path.cwd().resolve()
+
+    def _stable_path(p: Path) -> str:
+        resolved = p.resolve()
+        try:
+            return str(resolved.relative_to(cwd))
+        except ValueError:
+            return str(p)
+
     payload = [
         {
-            "path": str(p.relative_to(Path.cwd())),
+            "path": _stable_path(p),
             "size": p.stat().st_size,
             "mtime": int(p.stat().st_mtime),
         }
