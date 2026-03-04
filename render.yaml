@@ -19,14 +19,14 @@ services:
     region: oregon  # Options: oregon, frankfurt, singapore, ohio
     
     # Health check
-    healthCheckPath: /_stcore/health
+    healthCheckPath: /
     
     # Environment variables
     envVars:
       - key: HUGGINGFACEHUB_API_TOKEN
         sync: false  # Set manually in Render dashboard
       - key: HF_INFERENCE_API
-        value: mistralai/Mistral-7B-Instruct-v0.2
+        value: meta-llama/llama-3.1-8b-instruct:free
       - key: PDF_DATA_PATH
         value: data/
       - key: VECTOR_STORE_PATH
@@ -34,11 +34,15 @@ services:
       - key: EMBEDDING_MODEL
         value: sentence-transformers/all-MiniLM-L6-v2
       - key: RETRIEVER_K
-        value: "3"
+        value: "4"
+      - key: LLM_PROVIDER
+        value: openrouter
+      - key: OPENROUTER_MODEL
+        value: meta-llama/llama-3.1-8b-instruct:free
+      - key: OPENROUTER_API_KEY
+        sync: false
       - key: EMBED_DEVICE
         value: cpu
-      - key: N_GPU_LAYERS
-        value: "0"
     
     # Auto-deploy on push to main
     autoDeploy: true

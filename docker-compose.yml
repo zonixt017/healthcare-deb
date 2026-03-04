@@ -10,22 +10,21 @@ services:
       dockerfile: Dockerfile
     container_name: healthcare-assistant
     ports:
-      - "8501:8501"
+      - "7860:7860"
     environment:
       # ── Cloud API (recommended for deployment) ──────────────────────────────
       - HUGGINGFACEHUB_API_TOKEN=${HUGGINGFACEHUB_API_TOKEN:-}
       - HF_INFERENCE_API=${HF_INFERENCE_API:-mistralai/Mistral-7B-Instruct-v0.2}
-      
-      # ── Local model (if you want to use local GGUF) ─────────────────────────
-      - LOCAL_LLM_PATH=${LOCAL_LLM_PATH:-models/phi-2.Q4_K_M.gguf}
-      - N_GPU_LAYERS=${N_GPU_LAYERS:-0}  # Docker CPU-only by default
       
       # ── Data paths ──────────────────────────────────────────────────────────
       - PDF_DATA_PATH=data/
       - VECTOR_STORE_PATH=vectorstore
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
       - RETRIEVER_K=${RETRIEVER_K:-3}
-      - EMBED_DEVICE=cpu  # Docker container uses CPU
+      - EMBED_DEVICE=cpu
+      - LLM_PROVIDER=${LLM_PROVIDER:-openrouter}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-meta-llama/llama-3.1-8b-instruct:free}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
     
     volumes:
       # Persist vector store across container restarts

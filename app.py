@@ -1,787 +1,365 @@
+import hashlib
+import json
 import os
-import sys
+import time
 from pathlib import Path
-# ── GPU / CUDA path fix ────────────────────────────────────────────────────────
-# Fix CUDA_PATH if it's incorrectly set to the bin directory instead of the root.
-# llama-cpp-python expects CUDA_PATH to point to the CUDA installation root,
-# and it appends "\\bin" internally. If CUDA_PATH already ends with "\\bin",
-# it results in a double "\\bin\\bin" path which causes import failures.
-_cuda_path = os.environ.get("CUDA_PATH", "")
-if _cuda_path:
-    # Normalize path separators
-    _cuda_path_normalized = _cuda_path.replace("/", "\\").rstrip("\\")
-    # Check if the last directory component is "bin"
-    if os.path.basename(_cuda_path_normalized).lower() == "bin":
-        # Strip the bin directory (the library will add it back)
-        _cuda_path = os.path.dirname(_cuda_path_normalized)
-        os.environ["CUDA_PATH"] = _cuda_path
-    else:
-        _cuda_path = _cuda_path_normalized
-    
-    # Verify the CUDA runtime DLL exists before proceeding
-    # Check for both CUDA 12 and CUDA 11 runtime DLLs
-    cuda_dll_exists = (
-        os.path.isfile(os.path.join(_cuda_path, "bin", "cudart64_12.dll")) or
-        os.path.isfile(os.path.join(_cuda_path, "bin", "cudart64_11.dll")) or
-        os.path.isfile(os.path.join(_cuda_path, "bin", "cudart64_110.dll"))
-    )
-    if not cuda_dll_exists:
-        # CUDA_PATH points to a non-existent or incomplete installation
-        os.environ.pop("CUDA_PATH", None)
+from typing import Dict, List, Optional, Tuple
 
-import streamlit as st
+import gradio as gr
+import requests
 from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_core.language_models.llms import LLM
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration  (all overridable via .env)
-# ─────────────────────────────────────────────────────────────────────────────
-PDF_DATA_PATH     = os.getenv("PDF_DATA_PATH",     "data/")
+# ── Config ────────────────────────────────────────────────────────────────────
+PDF_DATA_PATH = os.getenv("PDF_DATA_PATH", "data")
 VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "vectorstore")
-EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL",   "sentence-transformers/all-MiniLM-L6-v2")
-HF_INFERENCE_API  = os.getenv("HF_INFERENCE_API",  "mistralai/Mistral-7B-Instruct-v0.2")
-HF_API_TIMEOUT    = int(os.getenv("HF_API_TIMEOUT", "45"))
-HF_INFERENCE_TASK  = os.getenv("HF_INFERENCE_TASK", "conversational").strip() or "conversational"
-LOCAL_LLM_PATH    = os.getenv("LOCAL_LLM_PATH",    "models/phi-2.Q4_K_M.gguf")
-RETRIEVER_K       = int(os.getenv("RETRIEVER_K",   "3"))
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
+RETRIEVER_K = int(os.getenv("RETRIEVER_K", "4"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "7000"))
+APP_PORT = int(os.getenv("PORT", "7860"))
+APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
+
+# LLM provider settings
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER", "huggingface") or "huggingface").strip().lower()
+HF_INFERENCE_API = os.getenv("HF_INFERENCE_API", "mistralai/Mistral-7B-Instruct-v0.2").strip()
 HF_INFERENCE_FALLBACKS = [
-    model.strip() for model in os.getenv("HF_INFERENCE_FALLBACKS", "").split(",") if model.strip()
+    m.strip() for m in os.getenv("HF_INFERENCE_FALLBACKS", "mistralai/Mistral-7B-Instruct-v0.3,Qwen/Qwen2.5-7B-Instruct").split(",") if m.strip()
 ]
-HF_INFERENCE_TASK_FALLBACKS = [
-    task.strip() for task in os.getenv("HF_INFERENCE_TASK_FALLBACKS", "text-generation,conversational").split(",") if task.strip()
-]
+HF_API_TIMEOUT = float(os.getenv("HF_API_TIMEOUT", "45"))
+HF_TASK = (os.getenv("HF_INFERENCE_TASK", "conversational") or "conversational").strip()
 
-# GPU layers: how many transformer layers to offload to GPU.
-# For GTX 1650 4 GB with Phi-2 Q4_K_M (~1.7 GB) → all 32 layers fit.
-# For Mistral-7B Q4_K_M (~4.1 GB) → use 20-24 layers (rest on CPU).
-# Set to 0 to force CPU-only.
-N_GPU_LAYERS = int(os.getenv("N_GPU_LAYERS", "32"))
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "45"))
 
-# Embedding device: "cuda" if GPU available, else "cpu"
-def _embedding_device() -> str:
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda"
-        return "cpu"
-    except ImportError:
-        return "cpu"
-    except Exception:
-        return "cpu"
-
-EMBED_DEVICE = os.getenv("EMBED_DEVICE", "") or _embedding_device()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Page config  (must be the very first Streamlit call)
-# ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="HealthCare Assistant",
-    page_icon="🩺",
-    layout="wide",
-    initial_sidebar_state="expanded",
+SYSTEM_PROMPT = (
+    "You are a careful healthcare information assistant. Use ONLY the supplied context. "
+    "If context is insufficient, say that clearly. Keep response concise, medically responsible, "
+    "and end with a short disclaimer that this is informational and not a diagnosis."
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom CSS — cleaner look, better chat bubbles
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-/* ── General ── */
-[data-testid="stAppViewContainer"] { background: #f8fafc; }
-[data-testid="stSidebar"]          { background: #1e293b; }
-[data-testid="stSidebar"] *        { color: #e2e8f0 !important; }
-[data-testid="stSidebar"] .stButton > button {
-    background: #334155; border: 1px solid #475569;
-    color: #e2e8f0; border-radius: 8px;
-}
-[data-testid="stSidebar"] .stButton > button:hover {
-    background: #ef4444; border-color: #ef4444; color: white;
-}
 
-/* ── Chat messages ── */
-[data-testid="stChatMessage"] {
-    border-radius: 12px;
-    padding: 4px 8px;
-    margin-bottom: 4px;
-}
+class RouterLLM(LLM):
+    """Simple LangChain-compatible LLM wrapper for HF Inference or OpenRouter."""
 
-/* ── Title ── */
-h1 { color: #0f172a !important; }
-
-/* ── Status badges ── */
-.status-badge {
-    display: inline-block;
-    padding: 2px 10px;
-    border-radius: 999px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    margin: 2px 0;
-}
-.badge-green  { background:#dcfce7; color:#166534; }
-.badge-blue   { background:#dbeafe; color:#1e40af; }
-.badge-yellow { background:#fef9c3; color:#854d0e; }
-.badge-red    { background:#fee2e2; color:#991b1b; }
-
-/* ── Source expander ── */
-[data-testid="stExpander"] { border: 1px solid #e2e8f0; border-radius: 8px; }
-</style>
-""", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lazy imports (only pulled in when actually needed)
-# ─────────────────────────────────────────────────────────────────────────────
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, AIMessage
-
-from huggingface_hub import InferenceClient
-from langchain_core.language_models.llms import LLM
-
-
-class HFInferenceLLM(LLM):
-    """Minimal LangChain-compatible wrapper around huggingface_hub InferenceClient."""
-
+    provider: str
     model_id: str
     token: str
-    timeout: float
+    timeout: float = 45.0
     task: str = "conversational"
-    temperature: float = 0.3
-    max_new_tokens: int = 512
+    max_new_tokens: int = 450
+    temperature: float = 0.2
+    base_url: str = ""
 
     @property
     def _llm_type(self) -> str:
-        return "hf-inference-client"
+        return f"router-{self.provider}"
 
     def _call(self, prompt: str, stop=None, run_manager=None, **kwargs) -> str:
-        client = InferenceClient(model=self.model_id, token=self.token, timeout=self.timeout)
-
-        if self.task == "conversational":
-            response = client.chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-            )
-            text = response.choices[0].message.content if response.choices else ""
+        if self.provider == "openrouter":
+            url = f"{self.base_url.rstrip('/')}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": self.model_id,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": self.temperature,
+                "max_tokens": self.max_new_tokens,
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["choices"][0]["message"]["content"]
         else:
-            text = client.text_generation(
-                prompt,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-            )
+            client = InferenceClient(model=self.model_id, token=self.token, timeout=self.timeout)
+            if self.task == "conversational":
+                output = client.chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=self.max_new_tokens,
+                    temperature=self.temperature,
+                )
+                text = output.choices[0].message.content if output.choices else ""
+            else:
+                text = client.text_generation(prompt, max_new_tokens=self.max_new_tokens, temperature=self.temperature)
 
         if stop:
             for token in stop:
                 if token and token in text:
                     text = text.split(token)[0]
                     break
-
-        return text
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM loader (no Streamlit UI calls inside cached function)
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="🔄 Loading language model…")
-def _load_llm_internal():
-    """
-    Internal LLM loader without Streamlit UI calls.
-    Returns: (llm, mode, error_message, gpu_info)
-    - llm: The loaded LLM or None if failed
-    - mode: "cloud", "local-gpu(nL)", or "local-cpu"
-    - error_message: Error string if failed, None otherwise
-    - gpu_info: Dict with GPU details for toast notification
-    """
-    hf_token = (
-        os.getenv("HUGGINGFACEHUB_API_TOKEN", "").strip()
-        or os.getenv("HF_TOKEN", "").strip()
-        or os.getenv("HUGGINGFACE_API_TOKEN", "").strip()
-    )
-    cloud_error = None
-
-    # ── 1. Cloud API ──────────────────────────────────────────────────────────
-    if hf_token:
-        candidate_models = [HF_INFERENCE_API, *HF_INFERENCE_FALLBACKS]
-        candidate_tasks = [HF_INFERENCE_TASK, *[t for t in HF_INFERENCE_TASK_FALLBACKS if t != HF_INFERENCE_TASK]]
-        cloud_errors = []
-
-        for model_id in candidate_models:
-            for task_name in candidate_tasks:
-                try:
-                    llm = HFInferenceLLM(
-                        model_id=model_id,
-                        token=hf_token,
-                        timeout=HF_API_TIMEOUT,
-                        task=task_name,
-                        temperature=0.3,
-                        max_new_tokens=512,
-                    )
-                    llm.invoke("Reply with exactly: ok")  # quick connectivity check
-                    if model_id == HF_INFERENCE_API and task_name == HF_INFERENCE_TASK:
-                        mode = "cloud"
-                    else:
-                        mode = f"cloud-fallback({model_id}|{task_name})"
-                    return llm, mode, None, None
-                except Exception as e:
-                    cloud_errors.append(f"{model_id}|{task_name}: {type(e).__name__}")
-
-        cloud_error = f"Cloud API unavailable ({'; '.join(cloud_errors)})"
-
-    # ── 2. Local GGUF (GPU-accelerated) ──────────────────────────────────────
-    if not os.path.exists(LOCAL_LLM_PATH):
-        cloud_hint = (
-            f"\n\nCloud attempt detail: {cloud_error}. "
-            "Check your Hugging Face token and verify `HF_INFERENCE_API` points to a model "
-            "available for Inference API/serverless calls."
-            if cloud_error else ""
-        )
-        error_msg = (
-            f"Local model not found at `{LOCAL_LLM_PATH}`.\n\n"
-            "**Quick fix:** Download a GGUF model and update `LOCAL_LLM_PATH` in your `.env`.\n\n"
-            "Recommended for your GTX 1650 (4 GB VRAM):\n"
-            "- `phi-2.Q4_K_M.gguf` — best quality/speed balance (~1.7 GB)\n"
-            "- `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` — fastest (~0.7 GB)\n\n"
-            "See `WIFI_SETUP_GUIDE.md` for download links.\n\n"
-            "Tip: on Hugging Face Spaces, add one of these secrets:\n"
-            "- `HUGGINGFACEHUB_API_TOKEN` (preferred)\n"
-            "- `HF_TOKEN`\n"
-            "- `HUGGINGFACE_API_TOKEN`"
-            + cloud_hint
-        )
-        return None, None, error_msg, None
-
-    try:
-        from langchain_community.llms import LlamaCpp
-
-        # Detect GPU availability
-        gpu_available = False
-        gpu_name = ""
-        try:
-            import torch
-            gpu_available = torch.cuda.is_available()
-            if gpu_available:
-                gpu_name = torch.cuda.get_device_name(0)
-        except ImportError:
-            pass
-
-        n_gpu = N_GPU_LAYERS if gpu_available else 0
-        gpu_info = None
-        if gpu_available:
-            gpu_info = {"name": gpu_name, "layers": n_gpu}
-
-        llm = LlamaCpp(
-            model_path=LOCAL_LLM_PATH,
-            temperature=0.2,
-            max_tokens=512,
-            n_ctx=2048,          # context window (lower = faster, less memory)
-            n_batch=256,         # prompt processing batch size
-            n_gpu_layers=n_gpu,  # layers offloaded to GPU (0 = CPU only)
-            n_threads=max(1, os.cpu_count() - 1),  # leave 1 core for OS
-            verbose=False,
-            f16_kv=True,         # use fp16 for key/value cache (saves VRAM)
-        )
-        mode = f"local-gpu({n_gpu}L)" if n_gpu > 0 else "local-cpu"
-        return llm, mode, None, gpu_info
-
-    except Exception as e:
-        return None, None, f"Failed to load local model: {e}", None
+        return text.strip()
 
 
-def load_llm():
-    """
-    Wrapper that handles UI feedback for LLM loading.
-    Priority order:
-      1. HuggingFace Inference API (cloud) — if token is set and reachable
-      2. Local GGUF via LlamaCpp with GPU offloading — fastest local option
-    """
-    llm, mode, error, gpu_info = _load_llm_internal()
-    
-    # Handle errors with UI feedback
-    if error:
-        st.error(f"❌ {error}")
-        st.stop()
-    
-    # Show GPU toast notification
-    if gpu_info:
-        st.toast(f"🚀 GPU detected: {gpu_info['name']} — offloading {gpu_info['layers']} layers", icon="✅")
-    
-    return llm, mode
+def _file_signature(pdf_paths: List[Path]) -> str:
+    payload = [
+        {
+            "path": str(p.relative_to(Path.cwd())),
+            "size": p.stat().st_size,
+            "mtime": int(p.stat().st_mtime),
+        }
+        for p in sorted(pdf_paths)
+    ]
+    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Vector-store loader (no Streamlit UI calls inside cached function)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _discover_vectorstore_paths():
-    """Discover likely FAISS vectorstore directories."""
-    candidates = []
-
-    # Explicit/common directories first
-    for candidate in [
-        VECTOR_STORE_PATH,
-        "vectorstore",
-        "vector_store",
-        "VectorStore",
-        "Vectorstore",
-        "faiss_index",
-        "index",
-    ]:
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-
-    # Hugging Face Spaces uploads can end up in arbitrary folders;
-    # search for directories containing a matching *.faiss/*.pkl pair.
-    try:
-        for faiss_file in Path('.').glob('**/*.faiss'):
-            parent = faiss_file.parent
-            parent_str = str(parent)
-            if parent_str.startswith('./.git') or '/.git/' in parent_str:
-                continue
-            if not (parent / f"{faiss_file.stem}.pkl").exists():
-                continue
-            if parent_str not in candidates:
-                candidates.append(parent_str)
-    except Exception:
-        # Keep startup resilient; explicit candidates above are still used.
-        pass
-
-    return candidates
+def _discover_pdfs() -> List[Path]:
+    root = Path(PDF_DATA_PATH)
+    if not root.exists():
+        return []
+    return [p for p in root.rglob("*.pdf") if p.is_file()]
 
 
-def _build_fallback_vectorstore(embeddings, reason: str):
-    """Build a minimal fallback vectorstore so the app can still start."""
-    fallback_text = (
-        "Knowledge base is unavailable right now. "
-        "A prebuilt vectorstore was not found and PDFs could not be processed. "
-        f"Reason: {reason}"
-    )
-    return FAISS.from_texts(
-        [fallback_text],
-        embedding=embeddings,
-        metadatas=[{"source": "system", "page": 0}],
-    )
+def _load_or_build_vectorstore() -> Tuple[FAISS, Dict[str, str]]:
+    start = time.time()
+    meta = {"status": "cached", "details": ""}
 
-
-@st.cache_resource(show_spinner="📚 Loading knowledge base…")
-def _load_vectorstore_internal():
-    """
-    Internal vectorstore loader without Streamlit UI calls.
-    Returns: (vector_store, source, error_message, build_info)
-    - vector_store: FAISS vector store or None if failed
-    - source: "cached" or "built"
-    - error_message: Error string if failed, None otherwise
-    - build_info: Dict with build progress details for UI display
-    """
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
         model_kwargs={"device": EMBED_DEVICE},
         encode_kwargs={"normalize_embeddings": True, "batch_size": 64},
     )
 
-    # ── Load cached index ─────────────────────────────────────────────────────
-    candidate_store_paths = _discover_vectorstore_paths()
+    store_dir = Path(VECTOR_STORE_PATH)
+    manifest_file = store_dir / "manifest.json"
 
-    cached_load_error = None
-    for store_path in candidate_store_paths:
+    pdf_paths = _discover_pdfs()
+    if not pdf_paths:
+        raise RuntimeError(f"No PDF files found under `{PDF_DATA_PATH}`.")
+
+    current_signature = _file_signature(pdf_paths)
+
+    # Reuse existing index if signature matches
+    if store_dir.exists() and (store_dir / "index.faiss").exists() and (store_dir / "index.pkl").exists() and manifest_file.exists():
         try:
-            store_dir = Path(store_path)
-            if not store_dir.exists() or not store_dir.is_dir():
-                continue
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            if manifest.get("signature") == current_signature:
+                vs = FAISS.load_local(str(store_dir), embeddings, allow_dangerous_deserialization=True)
+                meta["status"] = "cached"
+                meta["details"] = f"Loaded cached index for {len(pdf_paths)} PDF(s) in {time.time() - start:.2f}s"
+                return vs, meta
+        except Exception:
+            pass
 
-            # Prefer default LangChain naming first.
-            if (store_dir / "index.faiss").exists() and (store_dir / "index.pkl").exists():
-                vector_store = FAISS.load_local(
-                    str(store_dir), embeddings, allow_dangerous_deserialization=True
-                )
-                return vector_store, "cached", None, None
-
-            # Fallback: support custom stem names like my_store.faiss/my_store.pkl.
-            for faiss_file in store_dir.glob("*.faiss"):
-                stem = faiss_file.stem
-                if not (store_dir / f"{stem}.pkl").exists():
-                    continue
-                vector_store = FAISS.load_local(
-                    str(store_dir),
-                    embeddings,
-                    index_name=stem,
-                    allow_dangerous_deserialization=True,
-                )
-                return vector_store, "cached", None, None
-        except Exception as exc:
-            cached_load_error = (
-                f"Found cached index artifacts in `{store_path}` but failed to load: {exc}"
-            )
-    # ── Build from PDFs ───────────────────────────────────────────────────────
-    if not os.path.isdir(PDF_DATA_PATH) or not any(
-        f.lower().endswith(".pdf") for f in os.listdir(PDF_DATA_PATH)
-    ):
-        error_msg = (
-            f"No PDF files found in `{PDF_DATA_PATH}`. "
-            "Please add at least one PDF to the data directory."
-        )
-        if cached_load_error:
-            error_msg = f"{cached_load_error}. {error_msg}"
-        error_msg += f" Checked vectorstore paths: {', '.join(candidate_store_paths)}"
-        fallback_store = _build_fallback_vectorstore(embeddings, error_msg)
-        return fallback_store, "fallback", error_msg, {"fallback": True}
-
-    # Build vectorstore and collect progress info
-    pdf_paths = sorted(Path(PDF_DATA_PATH).glob("*.pdf"))
-    documents = []
-    skipped_pdfs = []
-
-    for pdf_path in pdf_paths:
+    # Build/rebuild index
+    all_docs = []
+    skipped = []
+    for path in pdf_paths:
         try:
-            file_docs = PyPDFLoader(str(pdf_path)).load()
-            if file_docs:
-                documents.extend(file_docs)
-            else:
-                skipped_pdfs.append(f"{pdf_path.name} (no extractable pages)")
+            docs = PyPDFLoader(str(path)).load()
+            for d in docs:
+                d.metadata["source"] = str(path)
+                d.metadata["page"] = int(d.metadata.get("page", 0)) + 1
+            all_docs.extend(docs)
         except Exception as exc:
-            skipped_pdfs.append(f"{pdf_path.name} ({exc})")
+            skipped.append(f"{path.name}: {type(exc).__name__}")
 
-    if not documents:
-        error_msg = (
-            "No valid PDF content could be loaded. "
-            "The PDF files may be corrupted, encrypted, or empty."
-        )
-        if skipped_pdfs:
-            error_msg += f" Skipped files: {', '.join(skipped_pdfs)}"
-        if cached_load_error:
-            error_msg = f"{cached_load_error}. {error_msg}"
-        error_msg += f" Checked vectorstore paths: {', '.join(candidate_store_paths)}"
-        fallback_store = _build_fallback_vectorstore(embeddings, error_msg)
-        build_info = {
-            "num_pages": 0,
-            "num_pdfs": 0,
-            "num_chunks": 1,
-            "device": EMBED_DEVICE.upper(),
-            "skipped_pdfs": skipped_pdfs,
-            "fallback": True,
-        }
-        return fallback_store, "fallback", error_msg, build_info
-
-    num_pages = len(documents)
-    num_pdfs = len(set(d.metadata.get('source', '') for d in documents))
+    if not all_docs:
+        raise RuntimeError(f"Could not load any PDFs. Skipped: {', '.join(skipped) if skipped else 'unknown error'}")
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=120,
-        add_start_index=True,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
-    chunks = splitter.split_documents(documents)
-    num_chunks = len(chunks)
+    chunks = splitter.split_documents(all_docs)
 
-    vector_store = FAISS.from_documents(chunks, embeddings)
-    vector_store.save_local(VECTOR_STORE_PATH)
-
-    build_info = {
-        "num_pages": num_pages,
-        "num_pdfs": num_pdfs,
-        "num_chunks": num_chunks,
-        "device": EMBED_DEVICE.upper(),
-        "skipped_pdfs": skipped_pdfs,
-    }
-
-    return vector_store, "built", None, build_info
-
-
-def load_vectorstore():
-    """
-    Wrapper that handles UI feedback for vectorstore loading.
-    Load FAISS index from disk (fast), or build it from PDFs on first run.
-    Embeddings run on GPU if available, otherwise CPU.
-    """
-    vector_store, source, error, build_info = _load_vectorstore_internal()
-    
-    # Handle errors with UI feedback
-    if error:
-        if source == "fallback" and vector_store is not None:
-            st.warning(f"⚠️ {error}")
-        else:
-            st.error(f"❌ {error}")
-            st.stop()
-    
-    # Show build progress if freshly built
-    if build_info:
-        with st.status("🔨 Building knowledge base from PDFs…", expanded=True) as status:
-            st.write("📄 Loading PDF files…")
-            st.write(f"✅ Loaded {build_info['num_pages']} pages from {build_info['num_pdfs']} PDF(s)")
-            if build_info.get("skipped_pdfs"):
-                st.write("⚠️ Skipped unreadable PDF(s):")
-                for skipped in build_info["skipped_pdfs"]:
-                    st.write(f"- {skipped}")
-            st.write("✂️ Splitting into chunks…")
-            st.write(f"✅ Created {build_info['num_chunks']} chunks")
-            st.write(f"🧮 Embedding chunks on {build_info['device']}…")
-            st.write("✅ Vector store saved to disk")
-            status.update(label="✅ Knowledge base ready!", state="complete")
-    
-    return vector_store, source
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Initialise resources (cached — only runs once per session)
-# ─────────────────────────────────────────────────────────────────────────────
-llm, llm_source         = load_llm()
-vector_store, vs_source = load_vectorstore()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RAG chain construction
-# ─────────────────────────────────────────────────────────────────────────────
-_CONTEXTUALIZE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "Given the conversation history and the latest user question, "
-     "rewrite the question as a fully self-contained query that can be "
-     "understood without the history. "
-     "Do NOT answer — only rewrite if necessary, otherwise return as-is."),
-    ("placeholder", "{chat_history}"),
-    ("human", "{input}"),
-])
-
-_QA_SYSTEM_PROMPT = (
-    "You are a knowledgeable and empathetic healthcare assistant. "
-    "Answer the user's question using ONLY the retrieved medical context below. "
-    "If the context does not contain enough information, say so clearly and "
-    "recommend consulting a qualified healthcare professional. "
-    "Never fabricate medical information. "
-    "Keep your answer clear, accurate, and concise (3–5 sentences). "
-    "Always end with a brief reminder that this is for informational purposes only "
-    "and is not a substitute for professional medical advice.\n\n"
-    "Context:\n{context}"
-)
-
-_QA_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", _QA_SYSTEM_PROMPT),
-    ("placeholder", "{chat_history}"),
-    ("human", "{input}"),
-])
-
-retriever = vector_store.as_retriever(
-    search_type="mmr",
-    search_kwargs={"k": RETRIEVER_K, "fetch_k": RETRIEVER_K * 4},
-)
-
-history_aware_retriever = create_history_aware_retriever(llm, retriever, _CONTEXTUALIZE_PROMPT)
-qa_chain                = create_stuff_documents_chain(llm, _QA_PROMPT)
-rag_chain               = create_retrieval_chain(history_aware_retriever, qa_chain)
-
-_SIMPLE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a friendly and professional healthcare assistant. "
-     "Greet the user warmly and let them know they can ask any medical or health-related question."),
-    ("human", "{input}"),
-])
-simple_chain = _SIMPLE_PROMPT | llm
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
-_INITIAL_GREETING = (
-    "Hello! 👋 I'm your **HealthCare Assistant**. "
-    "I can answer medical and health-related questions based on a curated medical knowledge base. "
-    "How can I help you today?"
-)
-
-_GREETINGS = frozenset({
-    "hi", "hello", "hey", "howdy", "greetings",
-    "good morning", "good afternoon", "good evening",
-    "sup", "what's up", "yo",
-})
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper utilities
-# ─────────────────────────────────────────────────────────────────────────────
-def _is_greeting(text: str) -> bool:
-    return text.strip().lower().rstrip("!.,?") in _GREETINGS
-
-
-def _extract_string(response) -> str:
-    if isinstance(response, str):
-        return response.strip()
-    if hasattr(response, "content"):
-        return response.content.strip()
-    return str(response).strip()
-
-
-def _build_lc_history(messages: list) -> list:
-    history = []
-    for msg in messages:
-        if msg["role"] == "user":
-            history.append(HumanMessage(content=msg["content"]))
-        elif msg["role"] == "assistant":
-            history.append(AIMessage(content=msg["content"]))
-    return history
-
-
-def _llm_mode_label(source: str) -> str:
-    if source == "cloud":
-        return "☁️ Cloud (HuggingFace)"
-    if source.startswith("cloud-fallback("):
-        value = source[len("cloud-fallback("):-1]
-        model, task = value.split("|", 1) if "|" in value else (value, "unknown-task")
-        return f"☁️ Cloud fallback ({model}, {task})"
-    if source.startswith("local-gpu"):
-        layers = source.split("(")[1].rstrip("L)") if "(" in source else "?"
-        return f"🚀 Local GPU ({layers} layers offloaded)"
-    return "💻 Local CPU"
-
-
-def _render_sources(sources: list):
-    if not sources:
-        return
-    with st.expander("📄 Source documents", expanded=False):
-        for i, src in enumerate(sources, 1):
-            page        = src.metadata.get("page", "?")
-            source_file = os.path.basename(src.metadata.get("source", "unknown"))
-            st.markdown(f"**[{i}] {source_file} — page {page}**")
-            snippet = src.page_content[:400]
-            if len(src.page_content) > 400:
-                snippet += "…"
-            st.caption(snippet)
-            if i < len(sources):
-                st.divider()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
-# ─────────────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.image("https://img.icons8.com/color/96/caduceus.png", width=72)
-    st.title("HealthCare Assistant")
-    st.caption("Powered by RAG + LangChain")
-
-    st.divider()
-
-    # ── System Status ─────────────────────────────────────────────────────────
-    st.subheader("🔧 System Status")
-
-    llm_label = _llm_mode_label(llm_source)
-    badge_cls = "badge-green" if "GPU" in llm_label or "Cloud" in llm_label else "badge-yellow"
-    st.markdown(
-        f'<span class="status-badge {badge_cls}">LLM: {llm_label}</span>',
-        unsafe_allow_html=True,
-    )
-    if vs_source == "cached":
-        vs_label = "📦 Cached"
-    elif vs_source == "fallback":
-        vs_label = "⚠️ Fallback"
-    else:
-        vs_label = "🔨 Freshly built"
-    st.markdown(
-        f'<span class="status-badge badge-blue">KB: {vs_label}</span>',
-        unsafe_allow_html=True,
+    vs = FAISS.from_documents(chunks, embedding=embeddings)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    vs.save_local(str(store_dir))
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "signature": current_signature,
+                "pdf_count": len(pdf_paths),
+                "pages": len(all_docs),
+                "chunks": len(chunks),
+                "embedding_model": EMBEDDING_MODEL,
+                "chunk_size": CHUNK_SIZE,
+                "chunk_overlap": CHUNK_OVERLAP,
+                "built_at": int(time.time()),
+                "skipped": skipped,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
-    embed_badge = "badge-green" if EMBED_DEVICE == "cuda" else "badge-blue"
-    st.markdown(
-        f'<span class="status-badge {embed_badge}">Embeddings: {EMBED_DEVICE.upper()}</span>',
-        unsafe_allow_html=True,
-    )
-
-    st.caption(f"Model: `{EMBEDDING_MODEL.split('/')[-1]}`")
-    st.caption(f"Retriever: MMR, k={RETRIEVER_K}")
-
-    st.divider()
-
-    # ── Controls ──────────────────────────────────────────────────────────────
-    if st.button("🗑️ Clear Chat", use_container_width=True):
-        st.session_state.messages = [
-            {"role": "assistant", "content": _INITIAL_GREETING}
-        ]
-        st.rerun()
-
-    if st.button("🔄 Rebuild Knowledge Base", use_container_width=True):
-        import shutil
-        if os.path.exists(VECTOR_STORE_PATH):
-            shutil.rmtree(VECTOR_STORE_PATH)
-        st.cache_resource.clear()
-        st.rerun()
-
-    st.divider()
-
-    # ── About ─────────────────────────────────────────────────────────────────
-    st.subheader("ℹ️ About")
-    st.markdown(
-        "This chatbot answers health-related questions using a curated medical "
-        "knowledge base via **Retrieval-Augmented Generation (RAG)**.\n\n"
-        "**⚠️ Disclaimer:** For *informational purposes only*. "
-        "Does **not** replace professional medical advice."
-    )
-
-    st.divider()
-    st.caption("v2.0 · [GitHub](https://github.com/zonixt017/Healthcare-Assistant-Chatbot)")
+    meta["status"] = "rebuilt"
+    meta["details"] = f"Built index: {len(pdf_paths)} PDF(s), {len(all_docs)} pages, {len(chunks)} chunks in {time.time() - start:.2f}s"
+    return vs, meta
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main chat UI
-# ─────────────────────────────────────────────────────────────────────────────
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": _INITIAL_GREETING}
-    ]
+def _select_llm() -> Tuple[RouterLLM, str]:
+    hf_token = (os.getenv("HUGGINGFACEHUB_API_TOKEN", "") or os.getenv("HF_TOKEN", "") or "").strip()
+    or_token = os.getenv("OPENROUTER_API_KEY", "").strip()
 
-st.title("🩺 HealthCare Assistant")
-st.caption("Ask me anything about health, symptoms, medications, or medical conditions.")
-
-# ── Render existing chat history ──────────────────────────────────────────────
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if message.get("sources"):
-            _render_sources(message["sources"])
-
-# ── Chat input ────────────────────────────────────────────────────────────────
-if prompt := st.chat_input("Ask a health-related question…"):
-    # Append & display user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # Generate assistant response
-    with st.chat_message("assistant"):
-        sources  = []
-        response = ""
-
-        try:
-            history = _build_lc_history(st.session_state.messages[:-1])
-
-            if _is_greeting(prompt) or not history:
-                # Lightweight path — no retrieval needed
-                with st.spinner("💬 Thinking…"):
-                    raw      = simple_chain.invoke({"input": prompt})
-                    response = _extract_string(raw)
-            else:
-                # Full RAG path
-                with st.spinner("🔍 Searching knowledge base…"):
-                    result   = rag_chain.invoke({"input": prompt, "chat_history": history})
-                    response = _extract_string(result.get("answer", ""))
-                    sources  = result.get("context", [])
-
-                if not response:
-                    response = (
-                        "I'm sorry, I couldn't find relevant information in my knowledge base. "
-                        "Please consult a qualified healthcare professional for this query."
-                    )
-
-        except Exception as e:
-            response = (
-                "⚠️ An error occurred while processing your request. "
-                "Please try again or rephrase your question."
+    # Provider priority: explicit provider, then fallback.
+    candidates = [LLM_PROVIDER, "openrouter", "huggingface"]
+    tried = []
+    for provider in candidates:
+        if provider == "openrouter" and or_token:
+            llm = RouterLLM(
+                provider="openrouter",
+                model_id=OPENROUTER_MODEL,
+                token=or_token,
+                timeout=OPENROUTER_TIMEOUT,
+                base_url=OPENROUTER_BASE_URL,
             )
-            st.error(f"Error details: {e}")
+            try:
+                llm.invoke("Reply with exactly: ok")
+                return llm, f"openrouter:{OPENROUTER_MODEL}"
+            except Exception as exc:
+                tried.append(f"openrouter ({type(exc).__name__})")
 
-        st.markdown(response)
-        _render_sources(sources)
+        if provider == "huggingface" and hf_token:
+            for model in [HF_INFERENCE_API, *HF_INFERENCE_FALLBACKS]:
+                llm = RouterLLM(
+                    provider="huggingface",
+                    model_id=model,
+                    token=hf_token,
+                    timeout=HF_API_TIMEOUT,
+                    task=HF_TASK,
+                )
+                try:
+                    llm.invoke("Reply with exactly: ok")
+                    return llm, f"huggingface:{model}"
+                except Exception as exc:
+                    tried.append(f"{model} ({type(exc).__name__})")
 
-    # Persist assistant message
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": response,
-        "sources": sources,
-    })
+    raise RuntimeError(
+        "No working cloud LLM found. Set OPENROUTER_API_KEY for free OpenRouter models or "
+        "HUGGINGFACEHUB_API_TOKEN for HF Inference API. Attempts: " + "; ".join(tried)
+    )
+
+
+def _format_history(history_pairs: List[Tuple[str, str]]) -> List:
+    msgs = []
+    for user_msg, bot_msg in history_pairs[-4:]:
+        if user_msg:
+            msgs.append(HumanMessage(content=user_msg))
+        if bot_msg:
+            msgs.append(AIMessage(content=bot_msg))
+    return msgs
+
+
+class RAGService:
+    def __init__(self):
+        self.vectorstore, self.vs_meta = _load_or_build_vectorstore()
+        self.retriever = self.vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": RETRIEVER_K, "fetch_k": max(RETRIEVER_K * 4, 12)},
+        )
+        self.llm, self.llm_label = _select_llm()
+
+    def answer(self, question: str, history: List[Tuple[str, str]]) -> Tuple[str, str]:
+        q = (question or "").strip()
+        if not q:
+            return "Please enter a question.", ""
+
+        docs = self.retriever.invoke(q)
+        docs = docs[:RETRIEVER_K]
+
+        context_parts = []
+        sources = []
+        total = 0
+        for d in docs:
+            page = d.metadata.get("page", "?")
+            src = os.path.basename(str(d.metadata.get("source", "unknown")))
+            chunk = d.page_content.strip()
+            if not chunk:
+                continue
+            if total + len(chunk) > MAX_CONTEXT_CHARS:
+                break
+            total += len(chunk)
+            context_parts.append(f"[{src} p.{page}] {chunk}")
+            sources.append(f"- {src} (page {page})")
+
+        context = "\n\n".join(context_parts)
+        history_text = "\n".join(
+            [f"User: {u}\nAssistant: {a}" for u, a in history[-3:] if u or a]
+        )
+
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"Recent conversation:\n{history_text or 'N/A'}\n\n"
+            f"Question:\n{q}\n\n"
+            f"Retrieved context:\n{context or 'No relevant context found.'}\n\n"
+            "Answer:"
+        )
+
+        answer = self.llm.invoke(prompt).strip()
+        if not answer:
+            answer = "I couldn't generate a grounded answer from the current knowledge base."
+
+        source_text = "\n".join(dict.fromkeys(sources)) if sources else "No sources retrieved."
+        return answer, source_text
+
+
+service = RAGService()
+
+
+def chat_fn(message: str, history: List[Dict]) -> str:
+    pairs = []
+    for item in history or []:
+        pairs.append((item.get("role") == "user" and item.get("content") or "", ""))
+    # Better pair extraction for type='messages'
+    compact_pairs = []
+    user_buffer = None
+    for item in history or []:
+        role = item.get("role")
+        content = item.get("content", "")
+        if role == "user":
+            user_buffer = content
+        elif role == "assistant":
+            compact_pairs.append((user_buffer or "", content))
+            user_buffer = None
+    if user_buffer:
+        compact_pairs.append((user_buffer, ""))
+
+    answer, sources = service.answer(message, compact_pairs)
+    return f"{answer}\n\n---\n**Sources**\n{sources}"
+
+
+with gr.Blocks(title="Healthcare RAG Assistant", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+# 🩺 Healthcare Assistant (RAG)
+Ask questions grounded in your medical PDFs. Supports multi-PDF ingestion, cached indexing, and cloud LLM routing.
+""")
+
+    with gr.Accordion("System status", open=False):
+        gr.Markdown(
+            f"""
+- **LLM**: `{service.llm_label}`
+- **Vectorstore**: `{service.vs_meta['status']}`
+- **Index details**: {service.vs_meta['details']}
+- **Embedding model**: `{EMBEDDING_MODEL}` on `{EMBED_DEVICE}`
+- **Retriever**: MMR, k={RETRIEVER_K}
+"""
+        )
+
+    gr.ChatInterface(
+        fn=chat_fn,
+        type="messages",
+        chatbot=gr.Chatbot(height=520, type="messages"),
+        textbox=gr.Textbox(placeholder="Ask a health question based on your PDFs...", lines=2),
+        title="",
+        description="⚠️ Informational use only. Not a substitute for professional medical advice.",
+    )
+
+
+if __name__ == "__main__":
+    demo.launch(server_name=APP_HOST, server_port=APP_PORT)
